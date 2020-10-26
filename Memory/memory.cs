@@ -8,10 +8,12 @@ using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Threading;
 using System.Globalization;
-using System.Windows.Forms;
+//using System.Windows.Forms;
 using System.Security.Principal;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
+using System.Reflection;
+using System.ComponentModel;
 
 namespace Memory
 {
@@ -135,6 +137,14 @@ namespace Memory
             uint dwFreeType
             );
 
+        [DllImport("psapi.dll")]
+        static extern uint GetModuleFileNameEx(IntPtr hProcess, IntPtr hModule, [Out] StringBuilder lpBaseName, [In][MarshalAs(UnmanagedType.U4)] int nSize);
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool EnumProcessModules(IntPtr hProcess,
+        [Out] IntPtr lphModule,
+        uint cb,
+        [MarshalAs(UnmanagedType.U4)] out uint lpcbNeeded);
+
         [DllImport("kernel32.dll")]
         private static extern bool ReadProcessMemory(IntPtr hProcess, UIntPtr lpBaseAddress, [Out] byte[] lpBuffer, UIntPtr nSize, IntPtr lpNumberOfBytesRead);
 
@@ -152,6 +162,10 @@ namespace Memory
             uint flAllocationType,
             uint flProtect
         );
+
+        [DllImport("kernel32.dll")]
+        static extern bool VirtualProtectEx(IntPtr hProcess, UIntPtr lpAddress,
+	        IntPtr dwSize, MemoryProtection flNewProtect, out MemoryProtection lpflOldProtect);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true)]
         public static extern UIntPtr GetProcAddress(
@@ -201,6 +215,65 @@ namespace Memory
 
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        private enum SnapshotFlags : uint
+        {
+            HeapList = 0x00000001,
+            Process = 0x00000002,
+            Thread = 0x00000004,
+            Module = 0x00000008,
+            Module32 = 0x00000010,
+            Inherit = 0x80000000,
+            All = 0x0000001F,
+            NoHeaps = 0x40000000
+        }
+        //inner struct used only internally
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct PROCESSENTRY32
+        {
+            const int MAX_PATH = 260;
+            internal UInt32 dwSize;
+            internal UInt32 cntUsage;
+            internal UInt32 th32ProcessID;
+            internal IntPtr th32DefaultHeapID;
+            internal UInt32 th32ModuleID;
+            internal UInt32 cntThreads;
+            internal UInt32 th32ParentProcessID;
+            internal Int32 pcPriClassBase;
+            internal UInt32 dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MAX_PATH)]
+            internal string szExeFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        public struct MODULEENTRY32
+        {
+            internal uint dwSize;
+            internal uint th32ModuleID;
+            internal uint th32ProcessID;
+            internal uint GlblcntUsage;
+            internal uint ProccntUsage;
+            internal IntPtr modBaseAddr;
+            internal uint modBaseSize;
+            internal IntPtr hModule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            internal string szModule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            internal string szExePath;
+        }
+
+        [DllImport("kernel32", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern IntPtr CreateToolhelp32Snapshot([In] UInt32 dwFlags, [In] UInt32 th32ProcessID);
+
+        [DllImport("kernel32", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern bool Process32First([In] IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+        [DllImport("kernel32.dll")]
+        static extern bool Module32First(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
+        [DllImport("kernel32.dll")]
+        static extern bool Module32Next(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
+
+        [DllImport("kernel32", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern bool Process32Next([In] IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
 
         // privileges
         const int PROCESS_CREATE_THREAD = 0x0002;
@@ -327,28 +400,28 @@ namespace Memory
         /// <summary>
         /// Open the PC game process with all security and access rights.
         /// </summary>
-        /// <param name="proc">Use process name or process ID here.</param>
+        /// <param name="pid">Use process name or process ID here.</param>
         /// <returns></returns>
         public bool OpenProcess(int pid)
         {
             if (!IsAdmin())
             {
-                Debug.WriteLine("WARNING: You are NOT running this program as admin! Visit https://github.com/erfg12/memory.dll/wiki/Administrative-Privileges");
-                MessageBox.Show("WARNING: You are NOT running this program as admin!");
+                Debug.WriteLine("WARNING: This program may not be running with raised privileges! Visit https://github.com/erfg12/memory.dll/wiki/Administrative-Privileges");
             }
+
+            if (pid <= 0)
+            {
+	            Debug.WriteLine("ERROR: OpenProcess given proc ID 0.");
+                return false;
+            }
+	            
+
+            if (theProc != null && theProc.Id == pid)
+	            return true;
 
             try
             {
-                if (theProc != null && theProc.Id == pid)
-                    return true;
-
-                if (pid <= 0)
-                {
-                    Debug.WriteLine("ERROR: OpenProcess given proc ID 0.");
-                    return false;
-                }
-
-                theProc = Process.GetProcessById(pid);
+	            theProc = Process.GetProcessById(pid);
 
                 if (theProc != null && !theProc.Responding)
                 {
@@ -357,26 +430,35 @@ namespace Memory
                 }
 
                 pHandle = OpenProcess(0x1F0FFF, true, pid);
-                Process.EnterDebugMode();
+
+                try { 
+                    Process.EnterDebugMode(); 
+                } catch (Win32Exception) { 
+                    //Debug.WriteLine("WARNING: You are not running with raised privileges! Visit https://github.com/erfg12/memory.dll/wiki/Administrative-Privileges"); 
+                }
 
                 if (pHandle == IntPtr.Zero)
                 {
                     var eCode = Marshal.GetLastWin32Error();
+                    Debug.WriteLine("ERROR: OpenProcess has failed opening a handle to the target process (GetLastWin32ErrorCode: " + eCode + ")");
+                    Process.LeaveDebugMode();
+                    theProc = null;
+                    return false;
                 }
+
+                // Lets set the process to 64bit or not here (cuts down on api calls)
+                Is64Bit = Environment.Is64BitOperatingSystem && (IsWow64Process(pHandle, out bool retVal) && !retVal);
 
                 mainModule = theProc.MainModule;
 
                 GetModules();
 
-                // Lets set the process to 64bit or not here (cuts down on api calls)
-                Is64Bit = Environment.Is64BitOperatingSystem && (IsWow64Process(pHandle, out bool retVal) && !retVal);
-
-                Debug.WriteLine("Program is operating at Administrative level. Process #" + theProc + " is open and modules are stored.");
+                Debug.WriteLine("Process #" + theProc + " is now open.");
 
                 return true;
             }
-            catch {
-                Debug.WriteLine("ERROR: OpenProcess has crashed. Are you trying to hack a x64 game? https://github.com/erfg12/memory.dll/wiki/64bit-Games");
+            catch (Exception ex) {
+                Debug.WriteLine("ERROR: OpenProcess has crashed. " + ex);
                 return false;
             }
         }
@@ -398,10 +480,18 @@ namespace Memory
         /// <returns></returns>
         public bool IsAdmin()
         {
-            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            try
             {
-                WindowsPrincipal principal = new WindowsPrincipal(identity);
-                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                {
+                    WindowsPrincipal principal = new WindowsPrincipal(identity);
+                    return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            } 
+            catch
+            {
+                Debug.WriteLine("ERROR: Could not determin if program is running as admin. Is the NuGet package \"System.Security.Principal.Windows\" missing?");
+                return false;
             }
         }
 
@@ -416,7 +506,6 @@ namespace Memory
             private set { _is64Bit = value; }
         }
 
-
         /// <summary>
         /// Builds the process modules dictionary (names with addresses).
         /// </summary>
@@ -425,12 +514,24 @@ namespace Memory
             if (theProc == null)
                 return;
 
+            if (_is64Bit && IntPtr.Size != 8)
+            {
+                Debug.WriteLine("WARNING: Game is x64, but your Trainer is x86! You will be missing some modules, change your Trainer's Solution Platform.");
+            }
+            else if (!_is64Bit && IntPtr.Size == 8)
+            {
+                Debug.WriteLine("WARNING: Game is x86, but your Trainer is x64! You will be missing some modules, change your Trainer's Solution Platform.");
+            }
+
             modules.Clear();
+
             foreach (ProcessModule Module in theProc.Modules)
             {
-                if (!string.IsNullOrEmpty(Module.ModuleName) && !modules.ContainsKey(Module.ModuleName))
-                    modules.Add(Module.ModuleName, Module.BaseAddress);
+                //if (!string.IsNullOrEmpty(Module.ModuleName) && !modules.ContainsKey(Module.ModuleName))
+                modules.Add(Module.ModuleName, Module.BaseAddress);
             }
+
+            Debug.WriteLine("Found " + modules.Count() + " process modules.");
         }
 
         public void SetFocus()
@@ -564,6 +665,37 @@ namespace Memory
             }
             return sb.ToString();
         }
+
+        #region protection
+        [Flags]
+        public enum MemoryProtection : uint
+        {
+	        Execute = 0x10,
+	        ExecuteRead = 0x20,
+	        ExecuteReadWrite = 0x40,
+	        ExecuteWriteCopy = 0x80,
+	        NoAccess = 0x01,
+	        ReadOnly = 0x02,
+	        ReadWrite = 0x04,
+	        WriteCopy = 0x08,
+	        GuardModifierflag = 0x100,
+	        NoCacheModifierflag = 0x200,
+	        WriteCombineModifierflag = 0x400
+        }
+
+        public bool ChangeProtection(string code, MemoryProtection newProtection, out MemoryProtection oldProtection, string file = "")
+        {
+	        UIntPtr theCode = GetCode(code, file);
+	        if (theCode == UIntPtr.Zero 
+	            || pHandle == IntPtr.Zero)
+	        {
+		        oldProtection = default;
+		        return false;
+	        }
+
+	        return VirtualProtectEx(pHandle, theCode, (IntPtr)(Is64Bit ? 8 : 4), newProtection, out oldProtection);
+        }
+        #endregion
 
         #region readMemory
         /// <summary>
@@ -718,14 +850,14 @@ namespace Memory
         /// <param name="code">address, module + pointer + offset, module + offset OR label in .ini file.</param>
         /// <param name="file">path and name of ini file. (OPTIONAL)</param>
         /// <returns></returns>
-        public UInt64 ReadUInt(string code, string file = "")
+        public UInt32 ReadUInt(string code, string file = "")
         {
             byte[] memory = new byte[4];
             UIntPtr theCode;
             theCode = GetCode(code, file);
 
             if (ReadProcessMemory(pHandle, theCode, memory, (UIntPtr)4, IntPtr.Zero))
-                return BitConverter.ToUInt64(memory, 0);
+                return BitConverter.ToUInt32(memory, 0);
             else
                 return 0;
         }
@@ -982,8 +1114,15 @@ namespace Memory
                     memory = stringEncoding.GetBytes(write);
                 size = memory.Length;
             }
+
             //Debug.Write("DEBUG: Writing bytes [TYPE:" + type + " ADDR:" + theCode + "] " + String.Join(",", memory) + Environment.NewLine);
-            return WriteProcessMemory(pHandle, theCode, memory, (UIntPtr)size, IntPtr.Zero);
+            bool WriteProcMem = false;
+            MemoryProtection OldMemProt = 0x00;
+
+            ChangeProtection(code, MemoryProtection.ExecuteReadWrite, out OldMemProt); // change protection
+            WriteProcMem = WriteProcessMemory(pHandle, theCode, memory, (UIntPtr)size, IntPtr.Zero);
+            ChangeProtection(code, OldMemProt, out _); // restore
+            return WriteProcMem;
         }
 
         /// <summary>
@@ -1375,18 +1514,18 @@ namespace Memory
         /// Inject a DLL file.
         /// </summary>
         /// <param name="strDllName">path and name of DLL file.</param>
-        public void InjectDll(String strDllName)
+        public bool InjectDll(String strDllName)
         {
             IntPtr bytesout;
 
             foreach (ProcessModule pm in theProc.Modules)
             {
                 if (pm.ModuleName.StartsWith("inject", StringComparison.InvariantCultureIgnoreCase))
-                    return;
+                    return false;
             }
 
             if (!theProc.Responding)
-                return;
+                return false;
 
             int lenWrite = strDllName.Length + 1;
             UIntPtr allocMem = VirtualAllocEx(pHandle, (UIntPtr)null, (uint)lenWrite, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1395,25 +1534,25 @@ namespace Memory
             UIntPtr injector = GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
 
             if (injector == null)
-                return;
+                return false;
 
             IntPtr hThread = CreateRemoteThread(pHandle, (IntPtr)null, 0, injector, allocMem, 0, out bytesout);
             if (hThread == null)
-                return;
+                return false;
 
             int Result = WaitForSingleObject(hThread, 10 * 1000);
             if (Result == 0x00000080L || Result == 0x00000102L)
             {
                 if (hThread != null)
                     CloseHandle(hThread);
-                return;
+                return false;
             }
             VirtualFreeEx(pHandle, allocMem, (UIntPtr)0, 0x8000);
 
             if (hThread != null)
                 CloseHandle(hThread);
 
-            return;
+            return true;
         }
 
 #if WINXP
@@ -1424,7 +1563,7 @@ namespace Memory
         /// <param name="code">Address to create the trampoline</param>
         /// <param name="newBytes">The opcodes to write in the code cave</param>
         /// <param name="replaceCount">The number of bytes being replaced</param>
-        /// <param name="allocationSize">size of the allocated region</param>
+        /// <param name="size">size of the allocated region</param>
         /// <param name="file">ini file to look in</param>
         /// <remarks>Please ensure that you use the proper replaceCount
         /// if you replace halfway in an instruction you may cause bad things</remarks>
