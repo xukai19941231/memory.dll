@@ -349,24 +349,27 @@ namespace Memory
         public void FreezeValue(string address, string type, string value, string file = "")
         {
             CancellationTokenSource cts = new CancellationTokenSource();
-            
-            if (FreezeTokenSrcs.ContainsKey(address))
-            {
-                Debug.WriteLine("Changing Freezing Address " + address + " Value " + value);
-                try
-                {
-                    FreezeTokenSrcs[address].Cancel();
-                    FreezeTokenSrcs.Remove(address);
-                }
-                catch
-                {
-                    Debug.WriteLine("ERROR: Avoided a crash. Address " + address + " was not frozen.");
-                }
-            }
-            else 
-                Debug.WriteLine("Adding Freezing Address " + address + " Value " + value);
 
-            FreezeTokenSrcs.Add(address, cts);
+            lock (FreezeTokenSrcs)
+            {
+                if (FreezeTokenSrcs.ContainsKey(address))
+                {
+                    Debug.WriteLine("Changing Freezing Address " + address + " Value " + value);
+                    try
+                    {
+                        FreezeTokenSrcs[address].Cancel();
+                        FreezeTokenSrcs.Remove(address);
+                    }
+                    catch
+                    {
+                        Debug.WriteLine("ERROR: Avoided a crash. Address " + address + " was not frozen.");
+                    }
+                }
+                else
+                    Debug.WriteLine("Adding Freezing Address " + address + " Value " + value);
+
+                FreezeTokenSrcs.Add(address, cts);
+            }
 
             Task.Factory.StartNew(() =>
             {
@@ -388,8 +391,11 @@ namespace Memory
             Debug.WriteLine("Un-Freezing Address " + address);
             try
             {
-                FreezeTokenSrcs[address].Cancel();
-                FreezeTokenSrcs.Remove(address);
+                lock (FreezeTokenSrcs)
+                {
+                    FreezeTokenSrcs[address].Cancel();
+                    FreezeTokenSrcs.Remove(address);
+                }
             }
             catch
             {
@@ -527,8 +533,8 @@ namespace Memory
 
             foreach (ProcessModule Module in theProc.Modules)
             {
-                //if (!string.IsNullOrEmpty(Module.ModuleName) && !modules.ContainsKey(Module.ModuleName))
-                modules.Add(Module.ModuleName, Module.BaseAddress);
+                if (!string.IsNullOrEmpty(Module.ModuleName) && !modules.ContainsKey(Module.ModuleName))
+                	modules.Add(Module.ModuleName, Module.BaseAddress);
             }
 
             Debug.WriteLine("Found " + modules.Count() + " process modules.");
@@ -568,18 +574,23 @@ namespace Memory
 
 
         /// <summary>
-        /// Get code from ini file.
+        /// Get code. If just the ini file name is given with no path, it will assume the file is next to the executable.
         /// </summary>
         /// <param name="name">label for address or code</param>
-        /// <param name="file">path and name of ini file</param>
+        /// <param name="iniFile">path and name of ini file</param>
         /// <returns></returns>
-        public string LoadCode(string name, string file)
+        public string LoadCode(string name, string iniFile)
         {
             StringBuilder returnCode = new StringBuilder(1024);
             uint read_ini_result;
 
-            if (file != "")
-                read_ini_result = GetPrivateProfileString("codes", name, "", returnCode, (uint)returnCode.Capacity, file);
+            if (iniFile != "")
+            {
+                if (File.Exists(iniFile))
+                    read_ini_result = GetPrivateProfileString("codes", name, "", returnCode, (uint)returnCode.Capacity, iniFile);
+                else
+                    Debug.WriteLine("ERROR: ini file \"" + iniFile + "\" not found!");
+            }
             else
                 returnCode.Append(name);
 
@@ -755,14 +766,19 @@ namespace Memory
         /// <param name="file">path and name of ini file. (OPTIONAL)</param>
         /// <param name="length">length of bytes to read (OPTIONAL)</param>
         /// <param name="zeroTerminated">terminate string at null char</param>
+        /// <param name="stringEncoding">System.Text.Encoding.UTF8 (DEFAULT). Other options: ascii, unicode, utf32, utf7</param>
         /// <returns></returns>
-        public string ReadString(string code, string file = "", int length = 32, bool zeroTerminated = true)
+        public string ReadString(string code, string file = "", int length = 32, bool zeroTerminated = true, System.Text.Encoding stringEncoding = null)
         {
+            if (stringEncoding == null)
+                stringEncoding = System.Text.Encoding.UTF8;
+
             byte[] memoryNormal = new byte[length];
             UIntPtr theCode;
             theCode = GetCode(code, file);
+
             if (ReadProcessMemory(pHandle, theCode, memoryNormal, (UIntPtr)length, IntPtr.Zero))
-                return (zeroTerminated) ? Encoding.UTF8.GetString(memoryNormal).Split('\0')[0] : Encoding.UTF8.GetString(memoryNormal);
+                return (zeroTerminated) ? stringEncoding.GetString(memoryNormal).Split('\0')[0] : stringEncoding.GetString(memoryNormal);
             else
                 return "";
         }
@@ -838,7 +854,7 @@ namespace Memory
 
             theCode = GetCode(code, file);
 
-            if (ReadProcessMemory(pHandle, theCode, memory, (UIntPtr)16, IntPtr.Zero))
+            if (ReadProcessMemory(pHandle, theCode, memory, (UIntPtr)8, IntPtr.Zero))
                 return BitConverter.ToInt64(memory, 0);
             else
                 return 0;
@@ -1039,7 +1055,8 @@ namespace Memory
         ///<param name="write">value to write to address.</param>
         ///<param name="file">path and name of .ini file (OPTIONAL)</param>
         ///<param name="stringEncoding">System.Text.Encoding.UTF8 (DEFAULT). Other options: ascii, unicode, utf32, utf7</param>
-        public bool WriteMemory(string code, string type, string write, string file = "", System.Text.Encoding stringEncoding = null)
+        ///<param name="RemoveWriteProtection">If building a trainer on an emulator (Ex: RPCS3) you'll want to set this to false</param>
+        public bool WriteMemory(string code, string type, string write, string file = "", System.Text.Encoding stringEncoding = null, bool RemoveWriteProtection = true)
         {
             byte[] memory = new byte[4];
             int size = 4;
@@ -1049,6 +1066,7 @@ namespace Memory
 
             if (type.ToLower() == "float")
             {
+                write = Convert.ToString(float.Parse(write, CultureInfo.InvariantCulture));
                 memory = BitConverter.GetBytes(Convert.ToSingle(write));
                 size = 4;
             }
@@ -1116,12 +1134,13 @@ namespace Memory
             }
 
             //Debug.Write("DEBUG: Writing bytes [TYPE:" + type + " ADDR:" + theCode + "] " + String.Join(",", memory) + Environment.NewLine);
-            bool WriteProcMem = false;
             MemoryProtection OldMemProt = 0x00;
-
-            ChangeProtection(code, MemoryProtection.ExecuteReadWrite, out OldMemProt); // change protection
+            bool WriteProcMem = false;
+            if (RemoveWriteProtection)
+                ChangeProtection(code, MemoryProtection.ExecuteReadWrite, out OldMemProt); // change protection
             WriteProcMem = WriteProcessMemory(pHandle, theCode, memory, (UIntPtr)size, IntPtr.Zero);
-            ChangeProtection(code, OldMemProt, out _); // restore
+            if (RemoveWriteProtection)
+                ChangeProtection(code, OldMemProt, out _); // restore
             return WriteProcMem;
         }
 
@@ -1131,10 +1150,11 @@ namespace Memory
         ///<param name="code">address, module + pointer + offset, module + offset OR label in .ini file.</param>
         ///<param name="type">byte, bytes, float, int, string or long.</param>
         /// <param name="write">byte to write</param>
-        /// <param name="moveQty">quantity to move</param>
+        /// <param name="MoveQty">quantity to move</param>
         /// <param name="file">path and name of .ini file (OPTIONAL)</param>
+        /// <param name="SlowDown">milliseconds to sleep between each byte</param>
         /// <returns></returns>
-        public bool WriteMove(string code, string type, string write, int moveQty, string file = "")
+        public bool WriteMove(string code, string type, string write, int MoveQty, string file = "", int SlowDown = 0)
         {
             byte[] memory = new byte[4];
             int size = 4;
@@ -1176,10 +1196,10 @@ namespace Memory
                 size = write.Length;
             }
 
-            UIntPtr newCode = UIntPtr.Add(theCode, moveQty);
+            UIntPtr newCode = UIntPtr.Add(theCode, MoveQty);
 
-            Debug.Write("DEBUG: Writing bytes [TYPE:" + type + " ADDR:[O]" + theCode + " [N]" + newCode + " MQTY:" + moveQty + "] " + String.Join(",", memory) + Environment.NewLine);
-            Thread.Sleep(1000);
+            //Debug.Write("DEBUG: Writing bytes [TYPE:" + type + " ADDR:[O]" + theCode + " [N]" + newCode + " MQTY:" + MoveQty + "] " + String.Join(",", memory) + Environment.NewLine);
+            Thread.Sleep(SlowDown);
             return WriteProcessMemory(pHandle, newCode, memory, (UIntPtr)size, IntPtr.Zero);
         }
 
@@ -1266,7 +1286,7 @@ namespace Memory
 
             // remove spaces
             if (theCode.Contains(" "))
-                theCode.Replace(" ", String.Empty);
+                theCode = theCode.Replace(" ", String.Empty);
 
             if (!theCode.Contains("+") && !theCode.Contains(",")) return new UIntPtr(Convert.ToUInt32(theCode, 16));
 
@@ -1610,7 +1630,6 @@ namespace Memory
             {
                 jmpBytes[i] = 0x90;
             }
-            WriteBytes(address, jmpBytes);
 
             byte[] caveBytes = new byte[5 + newBytes.Length];
             offset = (int)(((long)address + jmpBytes.Length) - ((long)caveAddress + newBytes.Length) - 5);
@@ -1620,6 +1639,7 @@ namespace Memory
             BitConverter.GetBytes(offset).CopyTo(caveBytes, newBytes.Length + 1);
 
             WriteBytes(caveAddress, caveBytes);
+            WriteBytes(address, jmpBytes);
 
             return caveAddress;
         }
@@ -1720,10 +1740,10 @@ namespace Memory
                 previous = current;
                 current = UIntPtr.Add(mbi.BaseAddress, (int)mbi.RegionSize);
 
-                if ((long)current > (long)maxAddress)
+                if ((long)current >= (long)maxAddress)
                     return ret;
 
-                if ((long)previous > (long)current)
+                if ((long)previous >= (long)current)
                     return ret; // Overflow
             }
 
